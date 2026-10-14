@@ -1,0 +1,26 @@
+- name: Test the installed Windows image over WinRM
+  hosts: windows
+  gather_facts: false
+  tasks:
+    - name: Wait for WinRM
+      ansible.builtin.wait_for_connection:
+        timeout: 180
+        sleep: 3
+
+    - name: Run ipconfig
+      ansible.windows.win_command: ipconfig
+      register: ipconfig_result
+      changed_when: false
+
+    - name: Show ipconfig
+      ansible.builtin.debug:
+        var: ipconfig_result.stdout_lines
+
+    - name: Run whoami
+      ansible.windows.win_command: whoami
+      register: whoami_result
+      changed_when: false
+
+    - name: Show whoami
+      ansible.builtin.debug:
+        var: whoami_result.stdout_lines
