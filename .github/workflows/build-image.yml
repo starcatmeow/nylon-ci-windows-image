@@ -40,7 +40,7 @@ jobs:
           fi
 
       - name: Install Nix
-        uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
         with:
           enable_kvm: true
           extra_nix_config: |
@@ -60,7 +60,7 @@ jobs:
       - name: Build the compressed qcow2 image
         run: nix build .#nylon-ci-win2025 --out-link result-ci --print-build-logs
 
-      - name: Read R2 credentials from Vault using GitHub OIDC
+      - name: Read R2 credentials and cache signing key from Vault using GitHub OIDC
         id: vault
         uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc # v4.0.0
         with:
@@ -72,25 +72,34 @@ jobs:
           secrets: |
             secret/data/nylon/windows-ci-image-r2 AWS_ACCESS_KEY_ID | AWS_ACCESS_KEY_ID ;
             secret/data/nylon/windows-ci-image-r2 AWS_SECRET_ACCESS_KEY | AWS_SECRET_ACCESS_KEY ;
-            secret/data/nylon/windows-ci-image-r2 AWS_ENDPOINT_URL_S3 | AWS_ENDPOINT_URL_S3
+            secret/data/nylon/windows-ci-image-r2 AWS_ENDPOINT_URL_S3 | AWS_ENDPOINT_URL_S3 ;
+            secret/data/nylon/nix-cache key | NIX_CACHE_SIGNING_KEY
 
-      - name: Upload the image to R2
+      - name: Publish the final image package to the R2 Nix cache
         env:
           AWS_ACCESS_KEY_ID: ${{ steps.vault.outputs.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ steps.vault.outputs.AWS_SECRET_ACCESS_KEY }}
           AWS_ENDPOINT_URL_S3: ${{ steps.vault.outputs.AWS_ENDPOINT_URL_S3 }}
-          AWS_CONFIG_FILE: ${{ runner.temp }}/nylon-aws-config
+          NIX_CACHE_SIGNING_KEY: ${{ steps.vault.outputs.NIX_CACHE_SIGNING_KEY }}
           AWS_EC2_METADATA_DISABLED: 'true'
           AWS_REQUEST_CHECKSUM_CALCULATION: when_required
           AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
         run: |
-          nix shell --inputs-from . nixpkgs#awscli2 --command bash -euo pipefail <<'UPLOAD'
-            aws configure set default.s3.preferred_transfer_client classic
-            aws s3 cp \
-              result-ci/nylon-ci-win2025.qcow2.zst \
-              s3://nylon-ci-windows-image/nylon-ci-win2025.qcow2.zst \
-              --endpoint-url "$AWS_ENDPOINT_URL_S3" \
-              --region auto \
-              --content-type application/zstd \
-              --only-show-errors
-          UPLOAD
+          image_path=$(readlink -f result-ci)
+          test -f "$image_path/nylon-ci-win2025.qcow2.zst"
+          if [[ -n "$(nix-store --query --references "$image_path")" ]]; then
+            echo '::error::The image package must have no runtime store dependencies.'
+            exit 1
+          fi
+
+          umask 077
+          signing_key=$(mktemp "$RUNNER_TEMP/nix-cache-key.XXXXXX")
+          trap 'rm -f "$signing_key"' EXIT
+          printf '%s\n' "$NIX_CACHE_SIGNING_KEY" > "$signing_key"
+          unset NIX_CACHE_SIGNING_KEY
+
+          endpoint="${AWS_ENDPOINT_URL_S3#https://}"
+          endpoint="${endpoint%/}"
+          # The image is already compressed. Enable multipart for NARs over 5 GiB.
+          nix copy --no-recursive "$image_path" --to \
+            "s3://nylon-ci-windows-image?scheme=https&endpoint=$endpoint&region=auto&compression=none&multipart-upload=true&multipart-chunk-size=67108864&secret-key=$signing_key"
